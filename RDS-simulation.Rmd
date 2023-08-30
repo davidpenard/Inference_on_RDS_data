@@ -1,0 +1,612 @@
+---
+title: "RDS - Simulation"
+author: "David - Chi"
+date: "2023-04-11"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r,include=FALSE}
+library(igraph)
+# library(ergm)
+# library(statnet.common)
+library(Matrix)
+library(tidyverse)
+library(dbplyr)
+library(ggplot2)
+
+```
+# Initialisation : 
+## Constantes
+```{r}
+# N<- 20 # taille de la population 
+# p=1/6  # paramètre de la loi géométrique 
+```
+
+## Fonctions 
+### Création d'un graphe
+```{r}
+# Création d'un graphe par configuration
+SimulGraph_configuration = function(N,p){
+  deg=rgeom(N,p)
+  if(sum(deg) %% 2 != 0) # si la somme des demi-arêtes n'est pas paire
+  {
+    deg[1]=deg[1]+1
+  }
+  # on crée les arêtes
+  nbaretes=sum(deg)/2
+  shuffle<-sample(rep(1:N,deg),2*nbaretes, replace=FALSE)
+  aretes<-matrix(data=shuffle,nrow=nbaretes,ncol=2 , byrow=TRUE)
+  graph0 <- graph.data.frame(aretes,directed=FALSE)
+  # V(graph0) = c(V(graph0),seq((length(V(graph0)+1):N)))
+  
+  # network0 = network(as.matrix(get.adjacency(graph0)),directed = FALSE)
+  return(list(graph0=graph0,aretes=aretes,isolated = c(N-length(V(graph0)) ))) # retirer aretes 
+}
+```
+
+
+```{r}
+SimulGraph_pk = function(pk,N_hat)
+  {
+  d_sim= sample(x=1:length(pk),size=N_hat,prob=pk,replace=T) # à mettre en dehors de la fonction
+
+  # si la somme des demi-arêtes n'est pas paire
+  if(sum(d_sim) %% 2 != 0) d_sim[1]=d_sim[1]+1
+  nbaretes = sum(d_sim)/2
+  shuffle<-sample(x=rep(1:length(d_sim),d_sim),size=nbaretes*2, replace=FALSE)
+  aretes<-matrix(data=shuffle,nrow=nbaretes,ncol=2 )
+  graph0 <- graph.data.frame(aretes,directed=FALSE)
+  return(list(graph0=graph0,aretes=aretes))
+}
+```
+
+
+### Exploration du graphe par RDS
+```{r}
+RDS = function(NbCoupons, # nombre total de coupons qu'on peut distribuer
+  CouponsADistribuer,# nombre de coupons qu'on donne à chaque personne)
+  NbVaguesMax = 1e10, 
+  Graph){
+### Initialisation
+  graph0 = Graph$graph0 
+  aretes = Graph$aretes
+  sommets=as.numeric(V(graph0)$name)
+  N = length(sommets)
+  components <- decompose.graph(graph0,mode="weak")
+  length(components)
+  comp.sizes <- unlist(lapply(components,vcount)) # vcount() 
+  comp.sizes.d <- table(comp.sizes)
+  
+  couponsrestants=NbCoupons
+  aretes_rds = matrix(ncol=2,byrow = T)
+  
+  # la proba de tirage détermine comment on distribue les coupons : 
+  # quelle est la proba de tirer les individus 1 (jamais mentionnés) ou 2 (mentionnés avant)
+  # (les codes 3 et 4 sont toujours à 0 car on ne leur redonne pas de coupons)
+  # idée : si probatirage=c(0,1,0,0), on ne distribue des coupons qu'aux individus déjà mentionnés
+  # on ne redonne pas de coupon à des gens déjà tirés ou ayant déjà un coupon
+   probatirage=c(1,1,0,0)# on ne tire que les individus qui n'ont pas encore été tirés
+   etats=rep(1,N) 
+  # codage : 1=non mentionné, 2=mentionné mais pas de coupon, 3=dispose d'un coupon, 4=interrogé
+###################
+# Echantillonnage #
+###################
+  v=sample.int(N,1) #v est le premier individu interrogé, choisi au hasard
+  etats[v]=4
+  if(length(adjacent_vertices(graph0, sommets == sommets[v], mode = "all"))>0){
+    # adjacent_vertices() récupère les points connectés avec "v" (igraph) 
+    
+    listevoisins=which(sommets%in%sommets[as.numeric(names(table(adjacent_vertices(graph0, sommets == sommets[v], mode = "all"))))])
+    etats[listevoisins[etats[listevoisins]==1]]=2 # les voisins sont mentionnés
+    
+    # On note les arètes entre v et ses voisins 
+    for(voisin in listevoisins) aretes_rds = rbind(aretes_rds,c(sommets[v],sommets[voisin]))
+    coup=as.numeric(sample(as.character(listevoisins),min(CouponsADistribuer,length(listevoisins),couponsrestants),replace=FALSE))
+      #on tire "CouponsADistribuer" voisins parmi tout les voisins de l'individu échantillonné 
+      # le coup du as.numeric as.character est pour éviter que R ne tire parmi les entiers entre 1 et listevoisins lorsque cette liste ne contient qu'un seul entier
+    etats[coup]=3
+    couponsrestants=NbCoupons-min(CouponsADistribuer,length(listevoisins),couponsrestants)
+  }
+  t=1
+
+### Propagation ###
+  while((couponsrestants>0 &sum(etats==4)<150 & sum(etats<3)>0))
+  {
+    #s'il n'y a plus de coupons en circulation, on interroge une nouvelle personne prise au hasard
+    if(sum(etats==3)==0)
+    {
+      # print("aucun coupon en circulation !")
+      v=sample.int(N,1,replace=FALSE,prob=(etats<3))
+    }
+    # s'il reste des coupons, l'un des individus avec un coupon est interrogé
+    if(sum(etats==3)>0)
+    {
+      v=sample.int(N,1,replace=FALSE,prob=(etats==3))
+    }
+    
+    etats[v]=4
+    
+    #ses voisins sont mentionnés
+    voisins1=0
+    voisins2=0
+
+    if(length(adjacent_vertices(graph0, sommets == sommets[v], mode = "all"))>0)
+    {
+      listevoisins=which(sommets%in%sommets[as.numeric(names(table(adjacent_vertices(graph0, sommets == sommets[v], mode = "all"))))])
+      # On note les arètes entre v et ses voisins 
+      for(voisin in listevoisins) aretes_rds = rbind(aretes_rds,c(sommets[v],sommets[voisin]))
+      voisins1=sum(etats[listevoisins]==1)
+      voisins2=sum(etats[listevoisins]==2)
+    }  
+    if(voisins1+voisins2>0)
+    {
+      etats[listevoisins[etats[listevoisins]==1]]=2
+      if(couponsrestants>0)
+      {
+        coup=as.numeric(sample(as.character(listevoisins),size=min(CouponsADistribuer,couponsrestants,voisins1*(probatirage[1]>0)+voisins2*(probatirage[2]>0)),replace=FALSE,prob=probatirage[etats[listevoisins]]))
+        etats[coup]=3
+        couponsrestants=couponsrestants-length(coup)
+      } 
+    }
+    #print(t);
+    t=t+1
+  }
+ 
+################
+#S_i, d_i, z_i #
+################ 
+  S = as.numeric(etats[order(sommets)]>=3)
+  # print(etats[order(sommets)])
+  #Matrice d'adjacence
+  rdsGraph = graph.data.frame(aretes_rds[-1,],directed=FALSE)
+  # print(aretes_rds)
+  # print(rdsGraph)
+  # vertex.attributes(rdsGraph,index = S)
+  # AdjMat = matrix(data = as.numeric(unlist(map(1:N, function(i) 
+  #   1:N%in%as.numeric(voisins[[i]][-1])))), nrow = N)   
+  # diag(AdjMat) = rep(0,N)
+  # rownames(AdjMat) = colnames(AdjMat) = 1:N
+  return(list(rdsGraph=rdsGraph, S=S))
+}
+```
+
+## Comparaison des tailles de composantes de 2 graphes
+```{r}
+# deg_dist = dgeom(1:500,2/3)
+# graphe_vrai = SimulGraph_pk(pk = deg_dist,N_hat = 500)
+# # 2 RDS sur le même graphe
+# graphe1 = RDS(NbCoupons = 100,CouponsADistribuer = 3,NbVaguesMax = 50,Graph = graphe_vrai)$rdsGraph
+# # plot(graphe1)
+# graphe2 = RDS(NbCoupons = 100,CouponsADistribuer = 3,NbVaguesMax = 50,Graph = graphe_vrai)$rdsGraph
+
+
+F_c = function(C,x) unlist(map(x,.f = function(u) sum(C[C<=u])/sum(C)))
+# "Fonction de répartition de C"
+
+d_comp = function(graphe1,graphe2){
+  # Les différentes composantes ordonnées par taille décroissantes
+  # On travail avec des proportions
+  comp1 = unlist(lapply(decompose.graph(graphe1,mode="weak"),vcount)) %>% 
+    .[order(.,decreasing = F)]
+  # comp1 = comp1/sum(comp1) #renormalisation
+  comp2 = unlist(lapply(decompose.graph(graphe2,mode="weak"),vcount)) %>% 
+    .[order(.,decreasing = F)]
+  # comp2 = comp2/sum(comp2)
+  comp12 = c(comp1,comp2) %>% 
+    .[order(.,decreasing = F)]
+  
+# On renvoie la différence entre les 2 répartions
+  return(sum(unlist(map(1:(length(comp12)-1),function(i) 
+  abs(F_c(comp1,comp12[i])-F_c(comp2,comp12[i]))*(comp12[i+1]-comp12[i]))
+  )))
+}
+
+# d_comp(graphe1 = graphe1,graphe2 = graphe2)
+
+```
+# Recuit simulé / Simulated annealing
+```{r}
+RecSim = function(d_crit, K,iteration){
+  if(d_crit <= 0 ) return(1)
+  else return(rbinom(1,1,prob = exp(-K*d_crit*log(iteration))) )
+}
+```
+
+
+
+
+# Algorithme (Gile et Handcock, 2015)
+### Données Iris
+```{r}
+data_reseau = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/donn�es/Fichier_reseau_final_csv.csv",header = T,sep = " ") 
+data_individus = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/donn�es/BASE_sommets_06-2023 - Sheet 1.csv",header = T,sep = ",")
+
+aretes_data = data_reseau[,-3]
+aretes_data = matrix(aretes_data[!is.na(aretes_data)],ncol=2)
+deg = data.frame(row.names = 1:max(aretes_data), unlist(map(1:max(aretes_data), function(i) sum(aretes_data == i))))
+RDS_Iris = graph.data.frame(aretes_data[,],directed = F)
+
+### Variable échantillonnage (interrogé/coupon ou juste mentionné)
+S_RDS_Iris = rep(0,max(data_individus$N..ego))
+for( u in 1:max(data_individus$N..ego)){
+  if(u%in%data_individus$N..ego)
+    if(data_individus$questionnaire[which(data_individus$N..ego==u)] %in% c("1","2"))
+      S_RDS_Iris[u] = 1 
+}
+
+### Variable genre (H=0, F=1)
+z_RDS = rep(NA,max(data_individus$N..ego))
+for( u in 1:max(data_individus$N..ego)){
+  if(u%in%data_individus$N..ego)
+      z_RDS[u] = ifelse(data_individus$sexe[which(data_individus$N..ego==u)]=="F",1,0) 
+}
+# z_RDS
+
+
+### Séparation des différentes composantes en 3 graphes (Paris, Aulnay + Slammeurs)
+id_indiv_chemsex = data_individus$N..ego[which(data_individus$Chemsex==1)]
+id_indiv_Aulnay =  data_individus$N..ego[which(data_individus$CAARUD=="Aulnay")]
+id_indiv_Paris = data_individus$N..ego[which(!(data_individus$N..ego%in%c(id_indiv_chemsex,id_indiv_Aulnay))&data_individus$questionnaire==1)]
+
+comp_graphe = decompose.graph(RDS_Iris,mode="weak")
+
+graphe_Aulnay = comp_graphe[unlist(map(comp_graphe,function(comp) any(as.numeric(names(V(comp)))%in%id_indiv_Aulnay)))] %>% 
+  graph.union
+
+graphe_Paris = comp_graphe[unlist(map(comp_graphe,function(comp) any(as.numeric(names(V(comp)))%in%id_indiv_Paris)))] %>% 
+  graph.union
+
+graphe_chemsex = comp_graphe[unlist(map(comp_graphe,function(comp) any(as.numeric(names(V(comp)))%in%id_indiv_chemsex)))] %>% 
+  .[-3]%>% 
+  graph.union
+
+### Plots (couleur = H/F)
+plot(graphe_Aulnay,vertex.size=8,vertex.color = ifelse(z_RDS[as.numeric(names(V(graphe_Aulnay)))]==1,"green","lightblue"),edge.width=3)
+
+plot(graphe_Paris,vertex.size=6,vertex.color = ifelse(z_RDS[as.numeric(names(V(graphe_Paris)))]==1,"green","lightblue"),vertex.label="",edge.width=3)
+
+plot(graphe_chemsex,vertex.size=6,vertex.color = ifelse(z_RDS[as.numeric(names(V(graphe_chemsex)))]==1,"green","lightblue"),vertex.label="",edge.width=3)
+
+col_comp = 1:max(as.numeric(names(V(RDS_Iris))))
+col_comp = ifelse(col_comp%in%as.numeric(names(V(graphe_Aulnay))),"lightgreen",
+                  ifelse(col_comp%in%as.numeric(names(V(graphe_Paris))),"lightblue","lightpink"))
+
+
+col_indiv = 1:max(as.numeric(names(V(RDS_Iris))))
+
+col_indiv = unlist(map(col_indiv),function(u)
+  ifelse(data_individus$CAARUD[which(data_individus$N..ego==u)]=="Aulnay","lightgreen",
+                  ifelse(data_individus$CAARUD[which(data_individus$N..ego==u)]=="Paris","lightblue","white")))
+
+plot(RDS_Iris,vertex.size=5,vertex.color=col_comp[as.numeric(names(V(RDS_Iris)))],vertex.label="" ,edge.width=3,ylim = c(-0.95,0.95))
+legend("topright", legend = c("Paris", "Aulnay", "Chemsex"), col=c("lightblue","lightgreen","lightpink"), pch = 21, pt.bg = c("lightblue","lightgreen","lightpink"), bty = "n",si)
+
+```
+
+## Constantes
+
+```{r}
+N = 500 # taille de la population simulée
+NbCoupons= 500 # nombre total de coupons qu'on peut distribuer
+# S'arreter après 150 indiv interrogés
+CouponsADistribuer= 3 # nombre de coupons qu'on donne à chaque personne
+NbVaguesMax = 50
+Nsim = 1
+NbModel = 50 # M1
+# NbRDS = 3 #M2
+epsilon = 25
+
+Proportion_Covariable = 1/5
+z_True = rbinom(N,1,prob = Proportion_Covariable)
+# les malades sont répartis aléatoirement et indépendamment dans la population
+p_geom = 1/2
+
+ # importance de la distribution de degré par rapport à la distribution des tailles de composantes
+alpha = 1/2
+```
+## Création des données
+```{r}
+deg_dist = dgeom(1:N,p_geom)
+True_pop = SimulGraph_pk(deg_dist,N)
+# True_pop$network0 %v% "infection_status" = z_True
+# plot(True_pop$graph0)
+N_True = length(V(True_pop$graph0))
+d_True = unlist(map(V(True_pop$graph0), function(vertex) 
+  length(table(adjacent_vertices(True_pop$graph0,V(True_pop$graph0) == vertex, mode = "all")))))
+# Vraie distribution de degrés du graphe
+pk_True = unlist(map(1:N_True, function(k) ifelse(sum(d_True==k)==0,0, sum(d_True==k)/length(d_True))))
+
+
+
+```
+## Gile & Handcock
+```{r}
+#Mesure des erreurs à la fin de chaque simulation
+mesure_EMV = c() # estimation de p_geom
+mesure_d_TV = c() # distance en variation totale sur la distribution de degrés
+mesure_N = c() # Estimation de N
+
+for(simulation in 1:1){
+list_N_hat_t = c()
+liste_d_C_t = c()
+liste_d_TV_t = c()
+# Première exploration par RDS
+ResRDS = RDS(NbCoupons = NbCoupons,CouponsADistribuer = CouponsADistribuer,NbVaguesMax = NbVaguesMax,Graph = True_pop)
+# S = ResRDS$S # les individus mentionnés
+S = S_RDS_Iris
+# rdsGraph = ResRDS$rdsGraph
+rdsGraph = graphe_Aulnay
+NbCoupons = sum(S[as.numeric(names(V(rdsGraph)))])
+Y_data = get.adjacency(rdsGraph,)
+Y_data = matrix(ifelse(Y_data>0,1,0),nrow = nrow(Y_data),ncol = ncol(Y_data),
+         dimnames = list(colnames(Y_data),colnames(Y_data))) #ordre graphe
+diag(Y_data)=rep(0,nrow(Y_data))
+nodenames = as.numeric(colnames(Y_data))
+# d_data = unlist(map(1:nrow(Y_data), function(i) sum(Y_data[nodenames==i,]))) %>% 
+#   .[which(S[nodenames]==1)]# ordre graphe
+d_data = unlist(map(1:length(S), function(i){
+  if(i%in%nodenames) return(sum(Y_data[nodenames==i,]))
+  else return(0)
+}))
+d_data = d_data[S==1]
+# distribution de degrés observée 
+pk_obs = unlist(map(1:max(d_data), function(k) sum(d_data==k)/sum(S)))
+# print(pk_obs)
+# probabilité d'échantillonnage initiale proportionnelle à d_i
+Pi_k = (1:N)/sum(d_data) *sum(S) # ordre des k (1:N) #sum(S) = nombre de personnes interrogées
+Pi_k = (1:N)/sum(d_data) *sum(S)
+# N_hat = round(sum(1/Pi_k[d_data[which(Pi_k[d_data]!=0)]])) # ignorer les pi_k = 0
+N_hat = length(V(rdsGraph))
+print(paste("N:",N_hat))
+
+pk = rep(0,max(d_data))
+  for(k in 1:length(pk)){
+      pk[k] =  ifelse(Pi_k[k]!=0, sum((d_data==k)/Pi_k[k])/sum(S),0)}
+
+d_TV_courant = 100
+d_C_courant = 100
+
+#### Mesures des erreurs par rapport au vrai graphe
+mesure_d_EMV = c(abs(1/mean((1:max(d_data))*pk)-p_geom)) # estimateur du max de vraissemblance 
+mesure_d_N = c(abs(N_True-N_hat))   # différence N_hat - N
+mesure_d_TV = c(sum(abs(pk - pk_True[1:max(d_data)])))
+#####
+
+
+### Boucle (3)
+for(iteration in 1:10){
+  ## Simulation de M graphes suivant la distribution de degrés pk
+  list_d_TV = c()
+  list_d_C = c()
+  table_Pi_k_model = matrix(ncol = N_hat)
+  for(gph in 1:NbModel){
+    # Création du graphe (fonction à créer)
+    resSimul = SimulGraph_pk(pk,N_hat)
+      #exploration par RDS
+      simRDS = RDS(NbCoupons=NbCoupons, CouponsADistribuer=CouponsADistribuer, NbVaguesMax=NbVaguesMax, Graph=resSimul)
+    # extraire les vecteurs d_sim et S_sim et estimation de Pi_k
+      d_sim = unlist(map(1:N_hat, function(k) sum(resSimul$aretes==k)))
+      S_sim = simRDS$S
+    Pi_k_model = unlist(map(1:N_hat, function(k) ifelse(sum(d_sim==k)==0,0,sum(d_sim==k&S_sim==1)/sum(d_sim==k))))
+    
+    # calcul de pk (la distribution de degrés) du graphe simulé
+    pk_model = unlist(map(1:max(max(d_sim),max(d_data)), function(k) sum(d_sim==k&S_sim==1)/sum(S_sim)))
+  
+    #calcul du d_TV pour le modèle
+    if(length(pk_obs)<=length(pk_model)) d_TV = sum(abs(pk_model -c(pk_obs,rep(0,length(pk_model)-length(pk_obs)))))
+    else d_TV = sum(abs(pk_obs -c(pk_model,rep(0,length(pk_obs)-length(pk_model)))))
+    list_d_TV = c(list_d_TV,d_TV)
+    
+    # d_comp distance entre les distribution de taille de composantes
+    d_C = d_comp(rdsGraph,simRDS$rdsGraph)
+    list_d_C = c(list_d_C,d_C)
+    # print(d_c)
+    table_Pi_k_model = rbind(table_Pi_k_model,Pi_k_model) 
+    #######
+  }
+  list_crit = alpha*list_d_TV + (1-alpha)*list_d_C # critère de sélection des graphes 
+  table_Pi_k_model = table_Pi_k_model[-1,] # on retire la première ligne de NA 
+  # on prend les meilleurs 10%
+  in_seuil_crit = list_crit <= list_crit[order(list_crit)][round(0.1*NbModel)] 
+  # Moyenne des meilleurs Pi_k estimés
+  Pi_k = as.numeric(colSums(table_Pi_k_model[in_seuil_crit,])/sum(in_seuil_crit))  
+
+  #estimation des proportions des degrés (provisoire)
+  # print(pk)
+  d_TV_nouveau = mean(list_d_TV[in_seuil_crit])
+  pk_nouveau = rep(0,max(d_data))
+  for(k in 1:length(pk)){
+      pk_nouveau[k] =  ifelse(Pi_k[k]!=0, sum((d_data==k)/Pi_k[k])/N_hat,0)
+  }
+  #recuit simulé
+  res_RecSim = RecSim(d_crit=d_TV_nouveau-d_TV_courant,K = 1 ,iteration = iteration )
+  d_TV_courant = res_RecSim*d_TV_nouveau + (1-res_RecSim)*d_TV_courant
+  pk = res_RecSim*pk_nouveau + (1-res_RecSim)*pk
+  
+  ####Inserer code pour RecSim()
+  d_C_nouveau = mean(list_d_C[in_seuil_crit])
+  N_hat_nouveau = round(sum(1/Pi_k[d_data[which(Pi_k[d_data]!=0)]])) # ignorer les pi_k = 0
+  #recuit simulé
+  res_RecSim = RecSim(d_crit=d_C_nouveau-d_C_courant,K = 1/3,iteration = iteration )
+  print(paste("delta_d_C :",d_C_nouveau-d_C_courant))
+  N_hat = res_RecSim*N_hat_nouveau + (1-res_RecSim)*N_hat
+  d_C_courant = res_RecSim*d_C_nouveau + (1-res_RecSim)*d_C_courant
+  print(paste("N:",N_hat))
+  # if(N_hat<length(d_data)){
+  #   print("Erreur : N_hat est trop petit ")
+  #   break}
+  
+  # erreur d'estimation de la taille de la population
+  mesure_d_N = c(mesure_d_N,abs(N_True-N_hat))
+  mesure_d_EMV = c(mesure_d_EMV, abs(1/sum((1:max(d_data))*pk)-p_geom)) 
+  mesure_d_TV = c(mesure_d_TV, sum(abs(pk - pk_True[1:max(d_data)])))
+  
+  list_N_hat_t = c(list_N_hat_t, N_hat)
+  liste_d_C_t = c(liste_d_C_t,d_C_courant)
+  liste_d_TV_t = c(liste_d_TV_t, d_TV_courant)
+}
+
+}
+
+# N_hat = round(sum(1/Pi_k[d_data[which(Pi_k[d_data]!=0)]])) # ignorer les pi_k = 0
+# N_hat
+# d_comp(True_pop$graph0,resSimul$graph0)
+
+plot(1:10, Pi_k[1:10],ylim = c(0,0.7))
+pk = pk/sum(pk)
+
+# plot(list_N_hat_t,ylim = c(0,max(list_N_hat_t)))
+# abline(a=500,b=0)
+plot(liste_d_C_t)
+plot((mesure_d_N),ylim = c(0,max(mesure_d_N)))
+# 
+plot(log(liste_d_TV_t))
+plot(log(mesure_d_TV))
+plot(log(mesure_d_EMV))
+# 
+# mean(list_N_hat_t[liste_d_C_t<5])
+# plot(pk_True[1:length(pk)],pk)
+# abline(a=0,b=1)
+# round(pk,3)
+# pk_True[1:length(pk)]
+# Crit_EMV_150 = c(Crit_EMV_150, 1/sum((1:max(d_data))*pk))
+# Crit_d_TV_150 = c(Crit_d_TV_150,mesure_d_TV[length(mesure_d_TV)])
+# Crit_N_150 = c(Crit_N_150,N_hat)
+
+# write.table(x = data.frame(N = list_N_hat),file = "N_hat_RecSim_150iterations.tab")
+# N_sim_recsim = read.table(file = "N_hat_RecSim_150iterations.tab", header = T)
+# plot(N_sim_recsim$N,breaks = 15)
+
+# boxplot(Crit_EMV_150)
+# title("p_hat estimé avec la méthode du maximum de vraisemblance (p = 1/3)")
+# boxplot(Crit_d_TV_150)
+# title("Erreur d'estimation d_TV sur la distribution de degrés P")
+# boxplot(Crit_N_150)
+# title("Estimation de N (N = 500)")
+```
+# Résultats avec différentes définitions de S
+```{r}
+# resultats_k1 = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/rstudio-export/simulation_table_K1_sim94.csv")
+# resultats_k0.1 = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/rstudio-export/simulation_table_K0.1_sim99.csv")
+# resultats_k0.01 = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/rstudio-export/simulation_table_K0.01_sim99.csv")
+# resultats_k0.001 = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/rstudio-export/simulation_table_K0.001_sim94.csv")
+
+
+```
+
+```{r}
+repdata = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/resultats_simulation_K/"
+df_N_K1 = df_N_K0.1 = df_N_K0.01 = df_N_K0.001 = data.frame(matrix(nrow = 15))
+for(sim in 1:99){
+  df_N_K1 = data.frame(df_N_K1, 
+                  rowSums(read.csv(file = paste0(repdata,"simulation_table_K",1,"_sim",sim,".csv"))[,2:3]))
+  df_N_K0.1 = data.frame(df_N_K1, 
+                  rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.1,"_sim",sim,".csv"))[,2:3]))
+  df_N_K0.01 = data.frame(df_N_K1, 
+                  rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.01,"_sim",sim,".csv"))[,2:3]))
+  df_N_K0.001 = data.frame(df_N_K1, 
+                  rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.001,"_sim",sim,".csv"))[,2:3]))
+}
+df_N_K1 = data.frame(map(0:99, function(sim){
+  return(rowSums(read.csv(file = paste0(repdata,"simulation_table_K",1,"_sim",sim,".csv"))[,2:3]))}))
+df_N_K0.1 = data.frame(map(0:99, function(sim){
+  return(rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.1,"_sim",sim,".csv"))[,2:3]))}))
+df_N_K0.01 = data.frame(map(0:99, function(sim){
+  return(rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.01,"_sim",sim,".csv"))[,2:3]))}))
+df_N_K0.001 = data.frame(map(1:99, function(sim){
+  return(rowSums(read.csv(file = paste0(repdata,"simulation_table_K",0.001,"_sim",sim,".csv"))[,2:3]))}))
+colnames(df_N_K1) = colnames(df_N_K0.1) = colnames(df_N_K0.01) = paste0("sim_",0:99)
+colnames(df_N_K0.001) = paste0("sim_",1:99)
+
+meanN_t = unlist(map(1:15))
+sdN_t = sqrt(apply(df_N_K1,1,var))
+plot_data = data.frame(time=1:15,K=c(rep(c(1,0.1,0.01),each=100),rep(0.001,99)), mean=meanN_t, sd = sdN_t,upper = meanN_t+2*sdN_t,lower=meanN_t-2*sdN_t)
+
+ggplot(plot_data, aes(x = time, y = mean,colour = "red",fill="red")) +
+  geom_line()+
+  geom_ribbon(aes(x = time, y = mean, ymax=upper,ymin=lower),alpha=0.2)+
+  xlab("Time") + ylab("Mean") +          # Labels for x-axis and y-axis
+  ggtitle("Evolution of Mean and sd")  # Title for the plot
+```
+
+```{r}
+res_final = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/normalement ça marche.csv")
+
+# res_final = rbind(res_final,read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/résultats simulations/resultats_estim_serveur K 1-0.001.csv"))
+# ggplot(res_final[(res_final$K%in%c(0.1,0.2,0.4,0.6,0.8,1)),], aes(x=N, color=as.factor(K)))+
+#   geom_density(stat="density")
+
+
+plot(density(res_final$d_TV[res_final$K==0.2]),col="red")
+lines(density(res_final$d_TV[res_final$K==0.4]),col="blue")
+
+
+# + 
+#   geom_vline(xintercept = 0.7)
+
+list_K = c(0.1,1,0.2,0.4,0.6,0.8,1)
+table_res = data.frame(K=list_K,
+                      mean = unlist(map(list_K, function(k) mean(res_final$N[which(res_final$K==k)]))),
+                      median = unlist(map(list_K, function(k) median(res_final$N[which(res_final$K==k)]))),
+                      var = unlist(map(list_K, function(k) var(res_final$N[which(res_final$K==k)]))),
+                      sd = unlist(map(list_K, function(k) sd(res_final$N[which(res_final$K==k)]))))
+
+```
+
+```{r}
+library(ggplot2)
+res_final = read.csv(file = "C:/Users/david/OneDrive/Bureau/Stage UnivGustEiffel/RDS/r�sultats simulations/res_test.csv")
+
+ggplot(res_final, aes(x=N, color=as.factor(K)))+
+  geom_density(stat="density")+
+  xlim(300,1200)
+
+
+
+map(as.numeric(names(table(res_final$K))),function(u) summary(res_final[which(res_final$K==u),]))
+```
+
+
+
+```{r}
+hist(resultats_S1$EMV,breaks = 20, xlim = c(0.35,0.55))
+abline(v = p_geom)
+hist(resultats_S2$EMV,breaks = 20, xlim = c(0.35,0.55))
+abline(v = p_geom)
+
+plot(density(resultats_S1$EMV),xlim = c(0.35,0.55),ylim=c(0,30),col="red")
+lines(density(resultats_S2$EMV),col="blue")
+abline(v = p_geom)
+
+```
+
+
+```{r}
+hist(resultats_S1$d_TV,breaks = 20)
+hist(resultats_S2$d_TV,breaks = 20)
+
+plot(density(resultats_S1$d_TV),xlim = c(0,0.8),col="red")
+lines(density(resultats_S2$d_TV),col="blue")
+
+```
+
+
+```{r}
+hist(resultats_S1$N,breaks = 20)
+abline(v=N_True)
+my_hist = hist(resultats_S2$N,breaks = 20)
+abline(v=1000)
+my_hist$counts
+
+m = which.max(my_hist$counts)
+mean(my_hist$breaks[m:(m+1)])
+
+
+```
+
